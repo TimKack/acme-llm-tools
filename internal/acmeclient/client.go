@@ -25,7 +25,8 @@ type acmeClient struct {
 	agentName     string
 	sessionID     acp.SessionId
 	noFS          bool
-	writeMu       sync.Mutex
+	body          *bodyWriter // ordered, buffered writes to win's body
+	writeMu       sync.Mutex  // guards inThought and keeps its marker with the chunk
 	promptMu      sync.Mutex
 	promptWin     *acme.Win
 	promptWinMu   sync.Mutex // guards promptWin
@@ -69,6 +70,8 @@ func Run(ctx context.Context, agentArgs []string, trace bool, resume string, noF
 	}
 
 	c := &acmeClient{win: w, noFS: noFS}
+	c.body = newBodyWriter(func(p []byte) { w.Write("body", p) })
+	defer c.body.close()
 
 	agentCtx, cancelAgent := context.WithCancel(ctx)
 	defer cancelAgent()
@@ -352,13 +355,17 @@ func (c *acmeClient) takePermInput(word string) bool {
 	return true
 }
 
+// appendLine writes s to the main window body after any output already
+// queued, and returns once it has been written.
 func (c *acmeClient) appendLine(s string) {
 	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	c.win.Write("body", []byte(s))
+	c.body.enqueue(s)
+	c.writeMu.Unlock()
+	c.body.flush()
 }
 
-// SessionUpdate handles streaming agent output.
+// SessionUpdate handles streaming agent output.  It only queues text for the
+// body writer so that it returns quickly; see bodyWriter.
 func (c *acmeClient) SessionUpdate(ctx context.Context, n acp.SessionNotification) error {
 	u := n.Update
 	switch {
@@ -367,10 +374,10 @@ func (c *acmeClient) SessionUpdate(ctx context.Context, n acp.SessionNotificatio
 		if content.Text != nil {
 			c.writeMu.Lock()
 			if c.inThought {
-				c.win.Write("body", []byte("]\n"))
+				c.body.enqueue("]\n")
 				c.inThought = false
 			}
-			c.win.Write("body", []byte("> "+content.Text.Text+"\n"))
+			c.body.enqueue("> " + content.Text.Text + "\n")
 			c.writeMu.Unlock()
 		}
 	case u.AgentMessageChunk != nil:
@@ -378,10 +385,10 @@ func (c *acmeClient) SessionUpdate(ctx context.Context, n acp.SessionNotificatio
 		if content.Text != nil {
 			c.writeMu.Lock()
 			if c.inThought {
-				c.win.Write("body", []byte("]\n"))
+				c.body.enqueue("]\n")
 				c.inThought = false
 			}
-			c.win.Write("body", []byte(content.Text.Text))
+			c.body.enqueue(content.Text.Text)
 			c.writeMu.Unlock()
 		}
 	case u.AgentThoughtChunk != nil:
@@ -389,10 +396,10 @@ func (c *acmeClient) SessionUpdate(ctx context.Context, n acp.SessionNotificatio
 		if content.Text != nil && content.Text.Text != "" {
 			c.writeMu.Lock()
 			if !c.inThought {
-				c.win.Write("body", []byte("[thought: "))
+				c.body.enqueue("[thought: ")
 				c.inThought = true
 			}
-			c.win.Write("body", []byte(content.Text.Text))
+			c.body.enqueue(content.Text.Text)
 			c.writeMu.Unlock()
 		}
 	case u.ToolCall != nil:
@@ -413,10 +420,10 @@ func (c *acmeClient) SessionUpdate(ctx context.Context, n acp.SessionNotificatio
 		sb.WriteByte('\n')
 		c.writeMu.Lock()
 		if c.inThought {
-			c.win.Write("body", []byte("]\n"))
+			c.body.enqueue("]\n")
 			c.inThought = false
 		}
-		c.win.Write("body", []byte(sb.String()))
+		c.body.enqueue(sb.String())
 		c.writeMu.Unlock()
 	case u.AvailableCommandsUpdate != nil:
 		upd := u.AvailableCommandsUpdate
